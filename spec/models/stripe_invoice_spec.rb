@@ -12,10 +12,55 @@ RSpec.describe StripeInvoice, type: :model do
       end
 
       it 'should create invoice for customer' do
+        # Mock the Stripe API call for line items
+        line_items_list = double(Stripe::ListObject)
+        allow(Stripe::Invoice).to receive(:list_lines)
+          .with(@stripe_invoice['id'], limit: 100)
+          .and_return(line_items_list)
+        allow(line_items_list).to receive(:auto_paging_each) do |&block|
+          @stripe_invoice['lines']['data'].each { |item| block.call(item) }
+        end
+
         expect(StripeInvoice).to receive(:create).with(account: @account,
                                                        stripe_invoice_id: @stripe_invoice['id']).and_return(@inv)
         expect(@inv).to receive(:create_line_items).with(@stripe_invoice['lines']['data'],
                                                          billing_reason: @stripe_invoice['billing_reason'])
+        StripeInvoice.create_for_account(@account, @stripe_invoice)
+      end
+    end
+
+    context 'with paginated line items (>10 items)' do
+      before :each do
+        @account = build(:account)
+        @stripe_invoice_id = 'in_test_paginated_123'
+        @stripe_invoice = { 'id' => @stripe_invoice_id, 'billing_reason' => 'subscription_cycle' }
+        @inv = mock_model Invoice
+
+        # Create 15 mock line items (simulating 2 pages: 10 + 5)
+        @all_items = (1..15).map do |i|
+          { 'id' => "il_#{i}", 'amount' => 1000 + i, 'description' => "Line item #{i}",
+            'price' => { 'product' => "prod_#{i}" }, 'discount_amounts' => [] }
+        end
+
+        # Mock Stripe API pagination
+        @list_page1 = double(Stripe::ListObject, has_more: true)
+        allow(Stripe::Invoice).to receive(:list_lines)
+          .with(@stripe_invoice_id, limit: 100).and_return(@list_page1)
+        allow(@list_page1).to receive(:auto_paging_each) { |&block| @all_items.each { |item| block.call(item) } }
+      end
+
+      it 'should fetch all line items across multiple pages' do
+        expect(StripeInvoice).to receive(:create).with(
+          account: @account,
+          stripe_invoice_id: @stripe_invoice_id
+        ).and_return(@inv)
+
+        # Verify all 15 items are passed to create_line_items
+        expect(@inv).to receive(:create_line_items).with(
+          @all_items,
+          billing_reason: @stripe_invoice['billing_reason']
+        )
+
         StripeInvoice.create_for_account(@account, @stripe_invoice)
       end
     end
@@ -79,7 +124,7 @@ RSpec.describe StripeInvoice, type: :model do
         expect(payments).to receive(:create).with(
           account: @account,
           reference_number: @stripe_invoice['id'],
-          date: Time.at(@stripe_invoice['status_transitions']['paid_at']),
+          date: Time.zone.at(@stripe_invoice['status_transitions']['paid_at']),
           method: 'Stripe',
           amount: @stripe_invoice['total'] / 100
         )

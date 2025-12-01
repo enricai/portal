@@ -10,9 +10,7 @@ class StripeInvoice < Invoice
 
       # When we create an invoice manually, Stripe doesn't append the quantity
       # to the description
-      if opts[:billing_reason] == 'manual'
-        li['description'] = "#{li['quantity']} × #{li['description']}"
-      end
+      li['description'] = "#{li['quantity']} × #{li['description']}" if opts[:billing_reason] == 'manual'
 
       line_items.create(code: @code,
                         description: li['description'],
@@ -33,7 +31,16 @@ class StripeInvoice < Invoice
 
   def self.create_for_account(account, invoice)
     inv = create(account: account, stripe_invoice_id: invoice['id'])
-    inv.create_line_items(invoice['lines']['data'], billing_reason: invoice['billing_reason'])
+
+    # Fetch all line items from Stripe API with pagination support
+    # The webhook payload only contains the first 10 items in invoice['lines']['data']
+    all_line_items = []
+    line_items_list = Stripe::Invoice.list_lines(invoice['id'], limit: 100)
+    line_items_list.auto_paging_each do |line_item|
+      all_line_items << line_item
+    end
+
+    inv.create_line_items(all_line_items, billing_reason: invoice['billing_reason'])
   end
 
   def self.link_to_invoice(arp_invoice_id, invoice)
@@ -43,29 +50,26 @@ class StripeInvoice < Invoice
       inv = Invoice.find(arp_invoice_id)
       inv.stripe_invoice_id = invoice['id']
       inv.save
-    rescue ActiveRecord::RecordNotFound => e
+    rescue ActiveRecord::RecordNotFound
       raise ArgumentError, "Provided Invoice ID #{arp_invoice_id} does not exist, cannot link Stripe invoice"
     end
   end
 
   def self.create_payment(account, invoice)
     inv = Invoice.find_by(stripe_invoice_id: invoice['id'])
+    raise "Invoice not found by Stripe invoice ID: #{invoice['id']}" unless inv
 
-    if inv
-      inv.payments.create(
-        account: account,
-        reference_number: invoice['id'],
-        date: Time.at(invoice['status_transitions']['paid_at']),
-        method: 'Stripe',
-        amount: invoice['total'] / 100.0
-      )
+    inv.payments.create(
+      account: account,
+      reference_number: invoice['id'],
+      date: Time.zone.at(invoice['status_transitions']['paid_at']),
+      method: 'Stripe',
+      amount: invoice['total'] / 100.0
+    )
 
-      if invoice['paid'] == true
-        inv.paid = true
-        inv.save
-      end
-    else
-      raise "Invoice not found by Stripe invoice ID: #{invoice['id']}"
+    if invoice['paid'] == true
+      inv.paid = true
+      inv.save
     end
 
     inv
@@ -84,7 +88,7 @@ class StripeInvoice < Invoice
 
     inv.payments.each do |payment|
       payment.amount = 0
-      payment.notes = 'Refunded on ' + charge_refunded_on(charge)
+      payment.notes = "Refunded on #{charge_refunded_on(charge)}"
       payment.save
     end
 
@@ -92,7 +96,7 @@ class StripeInvoice < Invoice
   end
 
   def self.charge_refunded_on(charge)
-    Time.at(charge['refunds']['data'].first['created']).to_s
+    Time.zone.at(charge['refunds']['data'].first['created']).to_s
   rescue StandardError
     ''
   end
